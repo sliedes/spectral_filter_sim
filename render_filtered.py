@@ -1,52 +1,95 @@
 #!/usr/bin/env python3
 
+import sys
+import functools
+
 import numpy as np
 import numpy.typing as npt
 import cv2
-import sys
-
 from matplotlib import pyplot as plt
 from matplotlib.widgets import Slider
 
-import xyz
+import lms
 import illuminant
 
 WAVELEN_BASE = 400
 WAVELEN_INC = 10
 NUM_IMAGES = 31
 
-DIRNAME = sys.argv[1].rstrip("/")
+WAVELEN_RED = 630
+WAVELEN_GREEN = 532
+WAVELEN_BLUE = 465
 
-WAVELENS = np.arange(WAVELEN_BASE, WAVELEN_BASE + WAVELEN_INC * NUM_IMAGES, WAVELEN_INC)
-D65 = np.array([illuminant.D65[x] for x in WAVELENS])
-
-im = (
-    np.array(
-        [
-            cv2.imread(f"data/{DIRNAME}/{DIRNAME}_{chan:02d}.png", cv2.IMREAD_UNCHANGED)
-            for chan in range(1, 1 + NUM_IMAGES)
-        ]
-    ).astype(float)
-    / 65535.0
-)
-
-xyz_of_wavelen = xyz.wavelen_to_xyz(WAVELENS)
+WAVELENS = np.arange(WAVELEN_BASE, WAVELEN_BASE + WAVELEN_INC * NUM_IMAGES, WAVELEN_INC)  # (NUM_IMAGES,)
+D65: npt.NDArray[np.float_] = np.array([illuminant.D65[x] for x in WAVELENS])  # (NUM_IMAGES,)
+MULTI_TO_LMS: npt.NDArray[np.float_] = np.array([lms.LMS[x] for x in WAVELENS])  # (NUM_IMAGES, 3)
+# xyz_of_wavelen = xyz.wavelen_to_xyz(WAVELENS.astype(float))
 
 
-def normalize(a: npt.ArrayLike):
+def normalize(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
     a = np.asarray(a)
-    return a / a.max()
+    return (a / a.max()).clip(0.0, 1.0)  # type: ignore[no-any-return]
 
 
-def calc_image(muls):
-    a = xyz.xyz2rgb(
-        normalize((xyz_of_wavelen * D65 * muls).dot(im.transpose(1, 0, 2)).transpose(1, 2, 0))
+RGB_TO_LMS: npt.NDArray[np.float_] = np.array(
+    [lms.LMS[WAVELEN_RED], lms.LMS[WAVELEN_GREEN], lms.LMS[WAVELEN_BLUE]]
+).T  # (3, 3)
+
+LMS_TO_RGB = np.linalg.inv(RGB_TO_LMS)  # (3, 3)
+
+# We want to set LMS scale factors so that D65 white maps to monitor native white, i.e. RGB 100%, 100%, 100%.
+# This corresponds to chromatic adaptation to D65 illumination.
+#
+# (D65 * MULTI_TO_LMS) ⊙ x * LMS_TO_RGB^T = 1.T
+# -->
+# x = (1/(D65 * MULTI_TO_LMS)) ⊙ RGB_TO_LMS * 1
+LMS_FACTORS = (1 / D65.dot(MULTI_TO_LMS)) * RGB_TO_LMS.dot([1, 1, 1])
+
+
+def srgb_to_linrgb(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
+    assert a.max() <= 1.0, a.max()
+    # This is almost, but not exactly, correct approximation of the sRGB transfer function
+    return a ** (1.0 / 2.2)
+
+
+def linrgb_to_srgb(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
+    assert a.max() <= 1.0, a.max()
+    return a**2.2
+
+
+@functools.lru_cache(maxsize=5)
+def load_image(name: str) -> npt.NDArray[np.float_]:  # (height, width, channel)
+    return srgb_to_linrgb(
+        np.array(
+            [
+                cv2.imread(f"data/{name}/{name}_{chan:02d}.png", cv2.IMREAD_UNCHANGED)
+                for chan in range(1, 1 + NUM_IMAGES)
+            ]
+        )
+        .astype(float)
+        .transpose(1, 2, 0)
+        / 65535.0
     )
-    print(a.max())
-    a /= a.max()
-    return a
 
 
-image = plt.imshow(calc_image(np.ones((NUM_IMAGES), dtype=float)))
+def load_lms_image(name: str, muls: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:  # (height, width, 3)
+    """Returns an image in the LMS space with chromatic adaptation adjustment corresponding to D65."""
+    im = load_image(name)  # (height, width, NUM_IMAGES)
+    return normalize((im * D65 * muls).dot(MULTI_TO_LMS) * LMS_FACTORS)
 
-plt.show()
+
+def main() -> None:
+    if len(sys.argv) >= 2:
+        image_name = sys.argv[1]
+    else:
+        image_name = "balloons_ms"
+    # plt.imshow(calc_image(image_name, np.ones((NUM_IMAGES), dtype=float)))
+    lms = load_lms_image(image_name, np.ones((NUM_IMAGES), dtype=float))
+    linrgb = normalize(lms.dot(LMS_TO_RGB.T))
+    srgb = linrgb_to_srgb(linrgb)
+    plt.imshow(linrgb)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
