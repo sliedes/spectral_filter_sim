@@ -1,13 +1,15 @@
 import numpy as np
 import numpy.typing as npt
 
+from my_types import FloatArr
 
-def normalize(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
+
+def normalize(a: FloatArr) -> FloatArr:
     a = np.asarray(a)
     return (a / a.max()).clip(0.0, 1.0)  # type: ignore[no-any-return]
 
 
-def srgb_to_linrgb(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
+def srgb_to_linrgb(a: FloatArr) -> FloatArr:
     assert a.max() <= 1.0, a.max()
     # This is almost, but not exactly, correct approximation of the sRGB transfer function
     a = a.copy()
@@ -17,7 +19,7 @@ def srgb_to_linrgb(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
     return a
 
 
-def linrgb_to_srgb(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
+def linrgb_to_srgb(a: FloatArr) -> FloatArr:
     assert a.max() <= 1.0, a.max()
     a = a.copy()
     lo_mask = a < 0.00313066844250063
