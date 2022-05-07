@@ -11,6 +11,7 @@ from matplotlib.widgets import Slider
 
 import lms
 import illuminant
+from color import srgb_to_linrgb, linrgb_to_srgb, normalize
 
 WAVELEN_BASE = 400
 WAVELEN_INC = 10
@@ -23,12 +24,6 @@ WAVELEN_BLUE = 465
 WAVELENS = np.arange(WAVELEN_BASE, WAVELEN_BASE + WAVELEN_INC * NUM_IMAGES, WAVELEN_INC)  # (NUM_IMAGES,)
 D65: npt.NDArray[np.float_] = np.array([illuminant.D65[x] for x in WAVELENS])  # (NUM_IMAGES,)
 MULTI_TO_LMS: npt.NDArray[np.float_] = np.array([lms.LMS[x] for x in WAVELENS])  # (NUM_IMAGES, 3)
-# xyz_of_wavelen = xyz.wavelen_to_xyz(WAVELENS.astype(float))
-
-
-def normalize(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
-    a = np.asarray(a)
-    return (a / a.max()).clip(0.0, 1.0)  # type: ignore[no-any-return]
 
 
 RGB_TO_LMS: npt.NDArray[np.float_] = np.array(
@@ -46,20 +41,9 @@ LMS_TO_RGB = np.linalg.inv(RGB_TO_LMS)  # (3, 3)
 LMS_FACTORS = (1 / D65.dot(MULTI_TO_LMS)) * RGB_TO_LMS.dot([1, 1, 1])
 
 
-def srgb_to_linrgb(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
-    assert a.max() <= 1.0, a.max()
-    # This is almost, but not exactly, correct approximation of the sRGB transfer function
-    return a ** (1.0 / 2.2)
-
-
-def linrgb_to_srgb(a: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:
-    assert a.max() <= 1.0, a.max()
-    return a**2.2
-
-
 @functools.lru_cache(maxsize=5)
 def load_image(name: str) -> npt.NDArray[np.float_]:  # (height, width, channel)
-    return srgb_to_linrgb(
+    a = (
         np.array(
             [
                 cv2.imread(f"data/{name}/{name}_{chan:02d}.png", cv2.IMREAD_UNCHANGED)
@@ -70,6 +54,7 @@ def load_image(name: str) -> npt.NDArray[np.float_]:  # (height, width, channel)
         .transpose(1, 2, 0)
         / 65535.0
     )
+    return a
 
 
 def load_lms_image(name: str, muls: npt.NDArray[np.float_]) -> npt.NDArray[np.float_]:  # (height, width, 3)
@@ -87,7 +72,8 @@ def main() -> None:
     lms = load_lms_image(image_name, np.ones((NUM_IMAGES), dtype=float))
     linrgb = normalize(lms.dot(LMS_TO_RGB.T))
     srgb = linrgb_to_srgb(linrgb)
-    plt.imshow(linrgb)
+    # plt.imsave("rendered.png", srgb)
+    plt.imshow(srgb)
     plt.show()
 
 
