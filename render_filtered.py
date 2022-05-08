@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-import sys, functools, os, threading
+import sys, functools, os
+from typing import Union
 
 import numpy as np
 import numpy.typing as npt
@@ -10,10 +11,29 @@ from scipy.interpolate import interp1d
 from scipy.optimize import minimize
 from sklearn.decomposition import PCA
 
+try:
+    import colored_traceback
+
+    colored_traceback.add_hook(always=True)
+except ImportError:
+    pass
+
+import tensorflow as tf
+from tensorflow.python.ops.numpy_ops import np_config
+
+np_config.enable_numpy_behavior()
+
+# from timer import timer
+# import logging
+
+# logging.basicConfig(level=logging.INFO)
+# timer.set_level(logging.INFO)
+
 import lms
 import illuminant
 from color import linrgb_to_srgb, normalize
-from my_types import FloatArr, Int32Arr
+
+# from my_types import FloatArr, Int32Arr
 
 WAVELEN_BASE = 400
 WAVELEN_INC = 10
@@ -23,30 +43,35 @@ WAVELEN_RED = 630
 WAVELEN_GREEN = 532
 WAVELEN_BLUE = 465
 
-IMG_WAVELENS = np.arange(WAVELEN_BASE, WAVELEN_BASE + WAVELEN_INC * NUM_IMAGES, WAVELEN_INC)  # (NUM_IMAGES,)
-PREC_WAVELENS: FloatArr = np.array(sorted(lms.LMS.keys()), dtype=np.float32)
-D65: FloatArr = np.array([illuminant.D65[x] for x in IMG_WAVELENS])  # (NUM_IMAGES,)
+IMG_WAVELENS = tf.range(
+    WAVELEN_BASE, WAVELEN_BASE + WAVELEN_INC * NUM_IMAGES, WAVELEN_INC, dtype=tf.int32
+)  # (NUM_IMAGES,)
+PREC_WAVELENS: tf.Tensor = tf.constant(sorted(lms.LMS.keys()), dtype=tf.int32)
+D65: tf.Tensor = tf.constant([illuminant.D65[int(x)] for x in IMG_WAVELENS], dtype=tf.float32)  # (NUM_IMAGES,)
 
-LMS_STD: FloatArr = np.array([lms.LMS[x] for x in lms.LMS.keys()], dtype=np.float32)
+STDLMS: tf.Tensor = tf.constant([lms.LMS[x] for x in lms.LMS.keys()], dtype=tf.float32)
 LMS_WAVELEN_MIN = min(lms.LMS.keys())
 LMS_WAVELEN_MAX = max(lms.LMS.keys())
 
 
-def lms_at(lms: FloatArr, lam_: npt.ArrayLike) -> FloatArr:
-    lam: Int32Arr = np.asarray(lam_, dtype=np.int32)
-    assert np.all(lam >= LMS_WAVELEN_MIN) and np.all(lam <= LMS_WAVELEN_MAX), lam
-    return lms[lam - LMS_WAVELEN_MIN]  # type: ignore[no-any-return]
+def lms_at(lms: tf.Tensor, lam_: Union[float, tf.Tensor]) -> tf.Tensor:
+    lam = tf.convert_to_tensor(lam_, dtype=tf.int32)
+    if tf.rank(lam) == 0:
+        assert lam >= LMS_WAVELEN_MIN and lam <= LMS_WAVELEN_MAX, lam
+    else:
+        assert tf.reduce_all(lam >= LMS_WAVELEN_MIN) and tf.reduce_all(lam <= LMS_WAVELEN_MAX), lam
+    return lms[lam - LMS_WAVELEN_MIN]
 
 
 # While we simulate arbitrary LMS, for displaying to the user in RGB we still want to use standard LMS
 # (could make this configurable though)
-RGB_TO_STD_LMS: FloatArr = np.array(
-    [lms_at(LMS_STD, WAVELEN_RED), lms_at(LMS_STD, WAVELEN_GREEN), lms_at(LMS_STD, WAVELEN_BLUE)], dtype=np.float32
+RGB_TO_STDLMS: tf.Tensor = tf.stack(
+    [lms_at(STDLMS, WAVELEN_RED), lms_at(STDLMS, WAVELEN_GREEN), lms_at(STDLMS, WAVELEN_BLUE)],
 ).T
-STD_LMS_TO_RGB = np.linalg.inv(RGB_TO_STD_LMS)  # (3, 3)
+STDLMS_TO_RGB = tf.linalg.inv(RGB_TO_STDLMS)  # (3, 3)
 
 
-def sample_lms(lms: FloatArr) -> FloatArr:
+def sample_lms(lms: tf.Tensor) -> tf.Tensor:  # (NUM_IMAGES, 3) or (441, 3) -> (NUM_IMAGES, 3)
     """Sample the given LMS spectrum at points that correspond to the image bands."""
     # Support the parameter being already sampled
     if lms.shape[-1] == len(IMG_WAVELENS):
@@ -55,35 +80,35 @@ def sample_lms(lms: FloatArr) -> FloatArr:
 
 
 @functools.lru_cache(maxsize=5)
-def load_multi_image_noall(name: str) -> FloatArr:  # (height, width, channel)
+def load_multi_image_noall(name: str) -> tf.Tensor:  # (height, width, channel)
     assert os.path.isdir(f"data/{name}"), name
-    a = (
-        np.array(
+    a = tf.transpose(
+        tf.constant(
             [
                 cv2.imread(f"data/{name}/{name}_{chan:02d}.png", cv2.IMREAD_UNCHANGED)
                 for chan in range(1, 1 + NUM_IMAGES)
-            ]
+            ],
+            dtype=tf.float32,
         )
-        .astype(np.float32)
-        .transpose(1, 2, 0)
-        / 65535.0
+        / 65535.0,
+        perm=(1, 2, 0),
     )
     return a
 
 
-WHOLE_IMAGE: FloatArr = None  # type: ignore[assignment]
+WHOLE_IMAGE: tf.Tensor = None
 
 
-def load_all_multi_images() -> FloatArr:  # (height, width, channel)
+def load_all_multi_images() -> tf.Tensor:  # (height, width, channel)
     global WHOLE_IMAGE
     if WHOLE_IMAGE is not None:
         return WHOLE_IMAGE
     ims = [load_multi_image_noall.__wrapped__(name) for name in sorted(os.listdir("data/"))]
-    WHOLE_IMAGE = np.concatenate(ims)
+    WHOLE_IMAGE = tf.concat(ims, 0)
     return WHOLE_IMAGE
 
 
-def load_multi_image(name: str) -> FloatArr:  # (height, width, channel)
+def load_multi_image(name: str) -> tf.Tensor:  # (height, width, channel)
     """Load a multichannel image.
 
     With special name '__all', load all images and stitch them together.
@@ -96,27 +121,30 @@ def load_multi_image(name: str) -> FloatArr:  # (height, width, channel)
 JACOBIAN_EPSILON = 1e-4
 
 
-def vec_plus_epsilons(vec: FloatArr) -> FloatArr:  # (n,) -> (n, n)
+def vec_plus_epsilons(vec: tf.Tensor) -> tf.Tensor:  # (n,) -> (n, n)
     assert len(vec.shape) == 1, vec.shape
-    a: FloatArr = np.tile(vec, (vec.shape[0], 1))
-    np.fill_diagonal(a, a.diagonal() + JACOBIAN_EPSILON)
+    a: tf.Tensor = tf.tile(vec, (vec.shape[0], 1))
+    tf.fill_diagonal(a, a.diagonal() + JACOBIAN_EPSILON)
     return a
 
 
-def multi_to_lms_adapted(im: FloatArr, my_lms: FloatArr) -> FloatArr:
+# @timer
+def multi_to_lms_adapted(im: tf.Tensor, my_lms: tf.Tensor) -> tf.Tensor:
     # We want to set LMS scale factors so that D65 white maps to monitor native white, i.e. RGB 100%, 100%, 100%.
     # This corresponds to chromatic adaptation to D65 illumination.
     #
     # (D65 * MULTI_TO_LMS) ⊙ x * LMS_TO_RGB^T = 1.T
     # -->
     # x = (1/(D65 * MULTI_TO_LMS)) ⊙ RGB_TO_LMS * 1
-    # LMS_FACTORS = (1 / D65.dot(my_lms_sample)) * RGB_TO_LMS.dot([1, 1, 1])
     my_lms_sample = sample_lms(my_lms)
-    LMS_FACTORS = (1 / D65.dot(my_lms_sample)) * RGB_TO_STD_LMS.dot([1, 1, 1])
-    return normalize((im * D65).dot(my_lms_sample) * LMS_FACTORS)
+    # LMS_FACTORS = (1 / D65.numpy().dot(my_lms_sample.numpy())) * RGB_TO_STDLMS.numpy().dot([1, 1, 1])
+    LMS_FACTORS = (1 / tf.tensordot(D65, my_lms_sample, axes=(0, 0))) * tf.math.reduce_sum(RGB_TO_STDLMS, 1)
+
+    return normalize(tf.matmul(im, (tf.expand_dims(D65, 1) * my_lms_sample * LMS_FACTORS)))
 
 
-def load_adapted_image_lms(name: str, my_lms: FloatArr) -> FloatArr:
+# @timer
+def load_adapted_image_lms(name: str, my_lms: tf.Tensor) -> tf.Tensor:
     """Load an image in the LMS space with the given modified LMS responses,
     with chromatic adaptation adjustment corresponding to D65.
 
@@ -125,12 +153,13 @@ def load_adapted_image_lms(name: str, my_lms: FloatArr) -> FloatArr:
     return multi_to_lms_adapted(load_multi_image(name), my_lms)
 
 
-def std_lms_to_rgb(im: FloatArr) -> FloatArr:
+def std_lms_to_rgb(im: tf.Tensor) -> tf.Tensor:
     """Transfer an LMS image to the RGB space, for an observer with normal responses to trichromatic RGB"""
-    return im.dot(STD_LMS_TO_RGB.T)
+    return im.dot(STDLMS_TO_RGB.T)
 
 
-def load_adapted_image_linrgb(name: str, my_lms: FloatArr) -> FloatArr:  # (height, width, 3)
+# @timer
+def load_adapted_image_linrgb(name: str, my_lms: tf.Tensor) -> tf.Tensor:  # (height, width, 3)
     """Load an image the linear RGB space with the given modified LMS responses,
     with chromatic adaptation adjustment corresponding to D65.
 
@@ -139,12 +168,12 @@ def load_adapted_image_linrgb(name: str, my_lms: FloatArr) -> FloatArr:  # (heig
     return normalize(std_lms_to_rgb(load_adapted_image_lms(name, my_lms)))
 
 
-def interp_freqs(freqs: FloatArr) -> FloatArr:
+def interp_freqs(freqs: tf.Tensor) -> tf.Tensor:
     f = interp1d(IMG_WAVELENS, freqs, kind="linear", bounds_error=False, fill_value=1.0)
-    return f(PREC_WAVELENS)  # type: ignore[no-any-return]
+    return tf.convert_to_tensor(f(PREC_WAVELENS), dtype=tf.float32)
 
 
-def shift_lms(lms_: FloatArr, l: int, m: int, s: int) -> FloatArr:
+def shift_lms(lms_: tf.Tensor, l: int, m: int, s: int) -> tf.Tensor:
     lms = np.zeros_like(lms_)
     for i, amount in enumerate([l, m, s]):
         if amount == 0:
@@ -153,35 +182,45 @@ def shift_lms(lms_: FloatArr, l: int, m: int, s: int) -> FloatArr:
             lms[amount:, i] = lms_[:-amount, i]
         else:
             lms[:amount, i] = lms_[-amount:, i]
-    return lms
+    return tf.convert_to_tensor(lms)
 
 
-def separation_score(lmsimg: FloatArr) -> float:
-    pca = PCA()
-    lmsimg = lmsimg.reshape(-1, 3)
-    pca.fit(lmsimg)
-    return pca.explained_variance_ratio_[-1] * 100  # type: ignore[no-any-return]
+# @timer
+def separation_score(lmsimg: npt.NDArray[np.float32]) -> float:
+    im = tf.convert_to_tensor(lmsimg.reshape(-1, 3), dtype=tf.float32)
+    eigval, _ = tf.linalg.eigh(tf.tensordot(tf.transpose(im), im, axes=1))
+    # print("Eigenvalues:", eigval)
+    return float(eigval[0] / tf.reduce_sum(eigval)) * 100
+
+    # pca = PCA()
+    #     lmsimg = lmsimg.reshape(-1, 3)
+    #     pca.fit(lmsimg)
+    # return pca.explained_variance_ratio_[-1] * 100  # type: ignore[no-any-return]
 
 
 # Apparently deuteranomalic M is usually shifted by about 17 nm
 # TODO: read literature on whether it still retains the same shape
-DEUT_LMS = shift_lms(LMS_STD, 0, 17, 0)
+DEUT_LMS = shift_lms(STDLMS, 0, 17, 0)
 
 
-def l65_brightness(filt: FloatArr, target_lms: FloatArr) -> float:
-    unfiltered = (D65).dot(sample_lms(target_lms)).sum()
-    filtered = (D65 * filt).dot(sample_lms(target_lms)).sum()
-    return filtered / unfiltered  # type: ignore[no-any-return]
+def l65_brightness(filt: tf.Tensor, target_lms: tf.Tensor) -> float:
+    unfiltered = tf.math.reduce_sum(tf.expand_dims(D65, 1) * sample_lms(target_lms))
+    filtered = tf.math.reduce_sum(tf.expand_dims(D65 * filt, 1) * sample_lms(target_lms))
+    return float(filtered / unfiltered)
 
 
-def score_of_filter(filt: FloatArr, name: str, target_lms: FloatArr) -> float:
+def score_of_filter(filt: tf.Tensor, name: str, target_lms: tf.Tensor) -> float:
+    filt = tf.cast(filt, tf.float32)
     lmsimg = load_adapted_image_lms(name, target_lms * interp_freqs(filt).reshape(-1, 1))
-    score = separation_score(lmsimg)
-    print("Score:", score)
-    print("L:", l65_brightness(filt, target_lms))
+    sep_score = separation_score(lmsimg)
+    print("Separation score:", sep_score)
+    lum_score = l65_brightness(filt, target_lms)
+    print("L:", lum_score)
+    score = sep_score + 0.02 * lum_score
+    print("Total:", score)
     print(filt)
     print()
-    return -separation_score(lmsimg)
+    return -score
 
 
 def main() -> None:
@@ -190,18 +229,24 @@ def main() -> None:
     else:
         image_name = "__all"  # "balloons_ms"
 
-    filt = np.ones((NUM_IMAGES,)) * 0.6
-    res = minimize(
-        score_of_filter,
-        filt,
-        args=(image_name, shift_lms(LMS_STD, 0, 0, 0)),
-        bounds=((0.2, 1.0),) * NUM_IMAGES,
-        options=dict(eps=0.0001),
-    )
-    print(res)
+    # filt = tf.ones((NUM_IMAGES,)) * 0.6
+    while True:
+        filt = tf.convert_to_tensor(np.random.uniform(0.3, 0.9, (NUM_IMAGES,)), dtype=tf.float32)
+        res = minimize(
+            score_of_filter,
+            filt,
+            args=(image_name, shift_lms(STDLMS, 0, 0, 0)),
+            bounds=((0.2, 1.0),) * NUM_IMAGES,
+            tol=1e-6,
+            options=dict(eps=1e-4),
+        )
+        print(res)
 
-    for freq, v in zip(IMG_WAVELENS, res.x):
-        print(freq, v)
+        for freq, v in zip(IMG_WAVELENS, res.x):
+            print(int(freq), float(v))
+
+        print()
+        print()
 
 
 if __name__ == "__main__":
