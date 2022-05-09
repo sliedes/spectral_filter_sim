@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import sys, functools, os
-from typing import Union
+from typing import Union, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -35,6 +35,9 @@ from color import linrgb_to_srgb, normalize
 
 # from my_types import FloatArr, Int32Arr
 
+TF_FLOAT = tf.float64
+NP_FLOAT = np.float64
+
 WAVELEN_BASE = 400
 WAVELEN_INC = 10
 NUM_IMAGES = 31
@@ -47,11 +50,14 @@ IMG_WAVELENS = tf.range(
     WAVELEN_BASE, WAVELEN_BASE + WAVELEN_INC * NUM_IMAGES, WAVELEN_INC, dtype=tf.int32
 )  # (NUM_IMAGES,)
 PREC_WAVELENS: tf.Tensor = tf.constant(sorted(lms.LMS.keys()), dtype=tf.int32)
-D65: tf.Tensor = tf.constant([illuminant.D65[int(x)] for x in IMG_WAVELENS], dtype=tf.float32)  # (NUM_IMAGES,)
+D65: tf.Tensor = tf.constant([illuminant.D65[int(x)] for x in IMG_WAVELENS], dtype=TF_FLOAT)  # (NUM_IMAGES,)
 
-STDLMS: tf.Tensor = tf.constant([lms.LMS[x] for x in lms.LMS.keys()], dtype=tf.float32)
+STDLMS: tf.Tensor = tf.constant([lms.LMS[x] for x in lms.LMS.keys()], dtype=TF_FLOAT)
 LMS_WAVELEN_MIN = min(lms.LMS.keys())
 LMS_WAVELEN_MAX = max(lms.LMS.keys())
+
+# Whether to apply D65 when loading
+STATIC_ILLUMINATION = True
 
 
 def lms_at(lms: tf.Tensor, lam_: Union[float, tf.Tensor]) -> tf.Tensor:
@@ -88,11 +94,13 @@ def load_multi_image_noall(name: str) -> tf.Tensor:  # (height, width, channel)
                 cv2.imread(f"data/{name}/{name}_{chan:02d}.png", cv2.IMREAD_UNCHANGED)
                 for chan in range(1, 1 + NUM_IMAGES)
             ],
-            dtype=tf.float32,
+            dtype=TF_FLOAT,
         )
         / 65535.0,
         perm=(1, 2, 0),
     )
+    if STATIC_ILLUMINATION:
+        a = a * tf.reshape(D65, (1, 1, -1))
     return a
 
 
@@ -140,7 +148,11 @@ def multi_to_lms_adapted(im: tf.Tensor, my_lms: tf.Tensor) -> tf.Tensor:
     # LMS_FACTORS = (1 / D65.numpy().dot(my_lms_sample.numpy())) * RGB_TO_STDLMS.numpy().dot([1, 1, 1])
     LMS_FACTORS = (1 / tf.tensordot(D65, my_lms_sample, axes=(0, 0))) * tf.math.reduce_sum(RGB_TO_STDLMS, 1)
 
-    return normalize(tf.matmul(im, (tf.expand_dims(D65, 1) * my_lms_sample * LMS_FACTORS)))
+    illum = my_lms_sample * LMS_FACTORS
+    if not STATIC_ILLUMINATION:
+        illum = tf.expand_dims(D65, 1) * illum
+
+    return normalize(tf.matmul(im, illum))
 
 
 # @timer
@@ -170,7 +182,7 @@ def load_adapted_image_linrgb(name: str, my_lms: tf.Tensor) -> tf.Tensor:  # (he
 
 def interp_freqs(freqs: tf.Tensor) -> tf.Tensor:
     f = interp1d(IMG_WAVELENS, freqs, kind="linear", bounds_error=False, fill_value=1.0)
-    return tf.convert_to_tensor(f(PREC_WAVELENS), dtype=tf.float32)
+    return tf.convert_to_tensor(f(PREC_WAVELENS), dtype=TF_FLOAT)
 
 
 def shift_lms(lms_: tf.Tensor, l: int, m: int, s: int) -> tf.Tensor:
@@ -186,11 +198,11 @@ def shift_lms(lms_: tf.Tensor, l: int, m: int, s: int) -> tf.Tensor:
 
 
 # @timer
-def separation_score(lmsimg: npt.NDArray[np.float32]) -> float:
-    im = tf.convert_to_tensor(lmsimg.reshape(-1, 3), dtype=tf.float32)
+def separation_score(lmsimg: npt.NDArray[NP_FLOAT]) -> tf.Tensor:
+    im = tf.convert_to_tensor(lmsimg.reshape(-1, 3), dtype=TF_FLOAT)
     eigval, _ = tf.linalg.eigh(tf.tensordot(tf.transpose(im), im, axes=1))
     # print("Eigenvalues:", eigval)
-    return float(eigval[0] / tf.reduce_sum(eigval)) * 100
+    return eigval[0] / tf.reduce_sum(eigval) * 100
 
     # pca = PCA()
     #     lmsimg = lmsimg.reshape(-1, 3)
@@ -203,24 +215,27 @@ def separation_score(lmsimg: npt.NDArray[np.float32]) -> float:
 DEUT_LMS = shift_lms(STDLMS, 0, 17, 0)
 
 
-def l65_brightness(filt: tf.Tensor, target_lms: tf.Tensor) -> float:
+def l65_brightness(filt: tf.Tensor, target_lms: tf.Tensor) -> tf.Tensor:
     unfiltered = tf.math.reduce_sum(tf.expand_dims(D65, 1) * sample_lms(target_lms))
     filtered = tf.math.reduce_sum(tf.expand_dims(D65 * filt, 1) * sample_lms(target_lms))
-    return float(filtered / unfiltered)
+    return filtered / unfiltered
 
 
 def score_of_filter(filt: tf.Tensor, name: str, target_lms: tf.Tensor) -> float:
-    filt = tf.cast(filt, tf.float32)
+    filt = tf.cast(filt, TF_FLOAT)
     lmsimg = load_adapted_image_lms(name, target_lms * interp_freqs(filt).reshape(-1, 1))
-    sep_score = separation_score(lmsimg)
-    print("Separation score:", sep_score)
-    lum_score = l65_brightness(filt, target_lms)
-    print("L:", lum_score)
-    score = sep_score + 0.02 * lum_score
-    print("Total:", score)
+    sep_score = separation_score(lmsimg) * 1000
+    print("Separation score:", float(sep_score))
+    lum = l65_brightness(filt, target_lms)
+    lum_score = -((1.0 / lum) ** 3) * 4
+    print("L:", float(lum))
+    print("L score:", float(lum_score))
+    score = sep_score + lum_score
+    print("Total:", float(score))
     print(filt)
     print()
-    return -score
+
+    return float(-score)
 
 
 def main() -> None:
@@ -229,16 +244,17 @@ def main() -> None:
     else:
         image_name = "__all"  # "balloons_ms"
 
-    # filt = tf.ones((NUM_IMAGES,)) * 0.6
     while True:
-        filt = tf.convert_to_tensor(np.random.uniform(0.3, 0.9, (NUM_IMAGES,)), dtype=tf.float32)
+        # filt = tf.ones((NUM_IMAGES,), dtype=TF_FLOAT) * 0.6
+        filt = tf.convert_to_tensor(np.random.uniform(0.3, 0.9, (NUM_IMAGES,)), dtype=TF_FLOAT)
         res = minimize(
             score_of_filter,
             filt,
             args=(image_name, shift_lms(STDLMS, 0, 0, 0)),
-            bounds=((0.2, 1.0),) * NUM_IMAGES,
-            tol=1e-6,
-            options=dict(eps=1e-4),
+            bounds=((0.01, 1.0),) * NUM_IMAGES,
+            #            tol=1e-5,
+            jac=False,
+            #            options=dict(eps=1e-3),
         )
         print(res)
 
