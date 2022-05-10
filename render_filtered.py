@@ -232,7 +232,7 @@ def score_of_filter(filt: tf.Tensor, name: str, target_lms: tf.Tensor) -> float:
     print("Separation score:", float(sep_score))
     lum = l65_brightness(filt, target_lms)
     # 4/lum^3 seems reasonable
-    lum_score = -((1.0 / lum) ** 3) * 4
+    lum_score = -((1.0 / lum) ** 3) * 2
     print("L:", float(lum))
     print("L score:", float(lum_score))
     score = sep_score + lum_score
@@ -260,9 +260,7 @@ def main() -> None:
             filt,
             args=(image_name, shift_lms(STDLMS, 0, 0, 0)),
             bounds=((0.01, 1.0),) * NUM_IMAGES,
-            #            tol=1e-5,
             jac=False,
-            #            options=dict(eps=1e-3),
         )
         print(res)
 
