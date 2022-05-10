@@ -11,6 +11,8 @@ from scipy.interpolate import interp1d
 from scipy.optimize import minimize
 from sklearn.decomposition import PCA
 
+from my_types import FloatArr
+
 try:
     import colored_traceback
 
@@ -18,25 +20,21 @@ try:
 except ImportError:
     pass
 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
 import tensorflow as tf
 from tensorflow.python.ops.numpy_ops import np_config
 
 np_config.enable_numpy_behavior()
 
-# from timer import timer
-# import logging
-
-# logging.basicConfig(level=logging.INFO)
-# timer.set_level(logging.INFO)
-
 import lms
 import illuminant
 from color import linrgb_to_srgb, normalize
 
-# from my_types import FloatArr, Int32Arr
-
 TF_FLOAT = tf.float64
 NP_FLOAT = np.float64
+
+NpFloatArr = npt.NDArray[NP_FLOAT]
 
 WAVELEN_BASE = 400
 WAVELEN_INC = 10
@@ -45,6 +43,12 @@ NUM_IMAGES = 31
 WAVELEN_RED = 630
 WAVELEN_GREEN = 532
 WAVELEN_BLUE = 465
+
+# Inverse scale factor for images (for speed). For example, use 2 to resize to 50%.
+# For optimizing filters, this is set from OPT_DOWNSCALE.
+DOWNSCALE = 1
+OPT_DOWNSCALE = 4
+
 
 IMG_WAVELENS = tf.range(
     WAVELEN_BASE, WAVELEN_BASE + WAVELEN_INC * NUM_IMAGES, WAVELEN_INC, dtype=tf.int32
@@ -85,18 +89,24 @@ def sample_lms(lms: tf.Tensor) -> tf.Tensor:  # (NUM_IMAGES, 3) or (441, 3) -> (
     return lms_at(lms, IMG_WAVELENS)
 
 
+def load_gray_img(fname: str) -> FloatArr:  # (height, width)
+    """Load image, possibly scaling it."""
+    a = cv2.imread(fname, cv2.IMREAD_UNCHANGED).astype(float) / 65535.0
+    assert len(a.shape) == 2, a.shape
+    if DOWNSCALE != 1:
+        a = cv2.resize(a, (a.shape[0] // DOWNSCALE, a.shape[1] // DOWNSCALE), interpolation=cv2.INTER_CUBIC)
+    return a  # type: ignore[no-any-return]
+
+
 @functools.lru_cache(maxsize=5)
 def load_multi_image_noall(name: str) -> tf.Tensor:  # (height, width, channel)
     assert os.path.isdir(f"data/{name}"), name
+    print(f"Loading image {name}...")
     a = tf.transpose(
         tf.constant(
-            [
-                cv2.imread(f"data/{name}/{name}_{chan:02d}.png", cv2.IMREAD_UNCHANGED)
-                for chan in range(1, 1 + NUM_IMAGES)
-            ],
+            [load_gray_img(f"data/{name}/{name}_{chan:02d}.png") for chan in range(1, 1 + NUM_IMAGES)],
             dtype=TF_FLOAT,
-        )
-        / 65535.0,
+        ),
         perm=(1, 2, 0),
     )
     if STATIC_ILLUMINATION:
@@ -197,17 +207,11 @@ def shift_lms(lms_: tf.Tensor, l: int, m: int, s: int) -> tf.Tensor:
     return tf.convert_to_tensor(lms)
 
 
-# @timer
-def separation_score(lmsimg: npt.NDArray[NP_FLOAT]) -> tf.Tensor:
+def separation_score(lmsimg: NpFloatArr) -> tf.Tensor:
     im = tf.convert_to_tensor(lmsimg.reshape(-1, 3), dtype=TF_FLOAT)
     eigval, _ = tf.linalg.eigh(tf.tensordot(tf.transpose(im), im, axes=1))
     # print("Eigenvalues:", eigval)
     return eigval[0] / tf.reduce_sum(eigval) * 100
-
-    # pca = PCA()
-    #     lmsimg = lmsimg.reshape(-1, 3)
-    #     pca.fit(lmsimg)
-    # return pca.explained_variance_ratio_[-1] * 100  # type: ignore[no-any-return]
 
 
 # Apparently deuteranomalic M is usually shifted by about 17 nm
@@ -216,8 +220,8 @@ DEUT_LMS = shift_lms(STDLMS, 0, 17, 0)
 
 
 def l65_brightness(filt: tf.Tensor, target_lms: tf.Tensor) -> tf.Tensor:
-    unfiltered = tf.math.reduce_sum(tf.expand_dims(D65, 1) * sample_lms(target_lms))
-    filtered = tf.math.reduce_sum(tf.expand_dims(D65 * filt, 1) * sample_lms(target_lms))
+    unfiltered = tf.math.reduce_sum(tf.expand_dims(D65, 1) * sample_lms(target_lms) * lms.TO_LUMINANCE)
+    filtered = tf.math.reduce_sum(tf.expand_dims(D65 * filt, 1) * sample_lms(target_lms) * lms.TO_LUMINANCE)
     return filtered / unfiltered
 
 
@@ -227,6 +231,7 @@ def score_of_filter(filt: tf.Tensor, name: str, target_lms: tf.Tensor) -> float:
     sep_score = separation_score(lmsimg) * 1000
     print("Separation score:", float(sep_score))
     lum = l65_brightness(filt, target_lms)
+    # 4/lum^3 seems reasonable
     lum_score = -((1.0 / lum) ** 3) * 4
     print("L:", float(lum))
     print("L score:", float(lum_score))
@@ -243,6 +248,9 @@ def main() -> None:
         image_name = sys.argv[1]
     else:
         image_name = "__all"  # "balloons_ms"
+
+    global DOWNSCALE
+    DOWNSCALE = OPT_DOWNSCALE
 
     while True:
         # filt = tf.ones((NUM_IMAGES,), dtype=TF_FLOAT) * 0.6

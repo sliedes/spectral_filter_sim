@@ -1,5 +1,8 @@
 from typing import Dict, Tuple
 import csv
+import numpy as np
+
+from my_types import FloatArr
 
 FNAME = "linss2_10e_1.csv"
 
@@ -17,3 +20,5 @@ def read_lms_table() -> Dict[int, Tuple[float, float, float]]:
 
 
 LMS = read_lms_table()
+
+TO_LUMINANCE: FloatArr = np.array([0.37095, 0.62905, 0.0])
